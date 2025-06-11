@@ -365,4 +365,10 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server is live on port ${PORT}`);
 });
 
+// Root route (optional, for testing in browser)
+app.get('/', (req, res) => {
+  res.send('Backend is working!');
+});
 
+// Favicon route (optional, avoids console error)
+app.get('/favicon.ico', (req, res) => res.sendStatus(204));
