@@ -85,27 +85,16 @@ app.put('/api/variations/:id/price', async (req, res) => {
   }
 });
 
-// Delete a variation
-app.delete('/api/variations/:id', async (req, res) => {
-  const { id } = req.params;
 
-  try {
-    await pool.query(`DELETE FROM product_variations WHERE id = $1`, [id]);
-    res.json({ message: 'Variation deleted successfully' });
-  } catch (error) {
-    console.error('Error deleting variation:', error);
-    res.status(500).json({ error: 'Failed to delete variation' });
-  }
-});
 
 // Get all customers (with search)
 app.get('/api/customers', async (req, res) => {
   const search = req.query.q || '';
   try {
     const result = await pool.query(
-      `SELECT * FROM customers
-       WHERE name ILIKE $1 OR email ILIKE $1 OR phone ILIKE $1 OR company ILIKE $1
-       ORDER BY created_at DESC
+      `SELECT DISTINCT ON (name, company) * FROM customers
+       WHERE (name ILIKE $1 OR email ILIKE $1 OR phone ILIKE $1 OR company ILIKE $1)
+       ORDER BY name, company, created_at DESC
        LIMIT 10`,
       [`%${search}%`]
     );
@@ -116,7 +105,9 @@ app.get('/api/customers', async (req, res) => {
   }
 });
 
+
 // Upsert a customer
+// ✅ Upsert: reuse if same name + company (treat NULL same as empty string)
 app.post('/api/customers/upsert', async (req, res) => {
   const {
     name = 'Unnamed',
@@ -126,102 +117,213 @@ app.post('/api/customers/upsert', async (req, res) => {
     address = ''
   } = req.body;
 
-  if (!name && !company) {
-    return res.status(400).json({ error: 'Customer must have a name or company' });
+  if (!name.trim() && !company.trim()) {
+    return res.status(400).json({ error: 'At least a name or company is required' });
   }
 
   try {
+    // 1️⃣ Normalize: treat empty string as NULL for comparison
     const result = await pool.query(
-      `INSERT INTO customers (name, company, email, phone, address)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (name, company) DO UPDATE SET
-         email = EXCLUDED.email,
-         phone = EXCLUDED.phone,
-         address = EXCLUDED.address
-       RETURNING id`,
-      [name, company, email, phone, address]
+      `SELECT id FROM customers 
+       WHERE 
+         COALESCE(name, '') = $1 AND 
+         COALESCE(company, '') = $2
+       LIMIT 1`,
+      [name.trim(), company.trim()]
     );
 
-    res.status(201).json({ message: 'Customer saved/updated', customerId: result.rows[0].id });
-  } catch (error) {
-    console.error('Error in /api/customers/upsert:', error);
-    res.status(500).json({ error: 'Failed to save/update customer' });
+    if (result.rows.length > 0) {
+      // 2️⃣ If found: update contact info + return existing ID
+      const customerId = result.rows[0].id;
+      await pool.query(
+        `UPDATE customers SET
+          email = $1,
+          phone = $2,
+          address = $3
+         WHERE id = $4`,
+        [email, phone, address, customerId]
+      );
+      return res.json({ customerId });
+    }
+
+    // 3️⃣ Else insert new
+    const insert = await pool.query(
+      `INSERT INTO customers (name, company, email, phone, address)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [name.trim(), company.trim(), email, phone, address]
+    );
+    res.json({ customerId: insert.rows[0].id });
+
+  } catch (err) {
+    console.error('Error in upsert:', err);
+    res.status(500).json({ error: 'Failed to upsert customer', details: err.message });
   }
 });
 
+
 // Save a new estimate
+// ✅ CREATE a new estimate
+// POST new estimate
 app.post('/api/estimates', async (req, res) => {
-  const { customerInfo, selectedItems } = req.body;
+  const { customer_id, customer_info, variationItems, customItems } = req.body;
+
+  if (!customer_id) {
+    return res.status(400).json({ error: 'customer_id is required' });
+  }
 
   try {
-    const { name, company, email, phone, address } = customerInfo;
-    const cleanedCustomerInfo = { name, company, email, phone, address };
+    // Calculate total
+    let total = 0;
 
+    // Sum variation items
+    for (const item of variationItems || []) {
+      const result = await pool.query(
+        `SELECT price FROM product_variations WHERE id = $1`,
+        [item.variation_id]
+      );
+      const price = result.rows[0]?.price || 0;
+      total += price * item.quantity;
+    }
+
+    // Sum custom items
+    for (const item of customItems || []) {
+      total += parseFloat(item.price) * item.quantity;
+    }
+
+    // Add tax
+    total = total * 1.06;
+
+    // Insert estimate with total
     const estimateResult = await pool.query(
-      `INSERT INTO estimates (customer_info, estimate_date)
-       VALUES ($1, NOW())
+      `INSERT INTO estimates (customer_id, customer_info, store_info, estimate_date, total)
+       VALUES ($1, $2, $3, NOW(), $4)
        RETURNING id`,
-      [cleanedCustomerInfo]
+      [customer_id, customer_info, {}, total]
     );
 
     const estimateId = estimateResult.rows[0].id;
 
-    for (const item of selectedItems) {
-      if (!item.variationId) {
-        console.warn(`Skipping custom item without variationId:`, item);
-        continue;
-      }
-
+    // Insert variation items
+    for (const item of variationItems || []) {
       await pool.query(
         `INSERT INTO estimate_items (estimate_id, product_variation_id, quantity)
          VALUES ($1, $2, $3)`,
-        [estimateId, item.variationId, item.quantity]
+        [estimateId, item.variation_id, item.quantity]
+      );
+    }
+
+    // Insert custom items
+    for (const item of customItems || []) {
+      await pool.query(
+        `INSERT INTO custom_estimate_items (estimate_id, product_name, size, price, quantity, accessory)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          estimateId,
+          item.product_name,
+          item.size,
+          item.price,
+          item.quantity,
+          item.accessory
+        ]
       );
     }
 
     res.status(201).json({ message: 'Estimate saved', estimateId });
-  } catch (error) {
-    console.error('Error saving estimate:', error);
-    res.status(500).json({ error: 'Internal server error' });
+
+  } catch (err) {
+    console.error('Error saving estimate:', err);
+    res.status(500).json({ error: 'Failed to save estimate', details: err.message });
   }
 });
 
-// Get all estimates with total amount
-app.get('/api/estimates', async (req, res) => {
+
+
+
+// ✅ UPDATE an existing estimate
+app.put('/api/estimates/:id', async (req, res) => {
+  const estimateId = req.params.id;
+  const { customer_id, customer_info, variationItems, customItems } = req.body;
+
   try {
-    const result = await pool.query(`
-      SELECT 
-        e.id,
-        e.customer_info,
-        e.estimate_date,
-        ROUND(COALESCE((
-          SELECT SUM(pv.price * ei.quantity)
-          FROM estimate_items ei
-          JOIN product_variations pv ON ei.product_variation_id = pv.id
-          WHERE ei.estimate_id = e.id
-        ), 0) * 1.06, 2) AS total
-      FROM estimates e
-      ORDER BY e.estimate_date DESC
-    `);
+    let total = 0;
 
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error retrieving estimates:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    for (const item of variationItems || []) {
+      const result = await pool.query(
+        `SELECT price FROM product_variations WHERE id = $1`,
+        [item.variation_id]
+      );
+      const price = result.rows[0]?.price || 0;
+      total += price * item.quantity;
+    }
+
+    for (const item of customItems || []) {
+      total += parseFloat(item.price) * item.quantity;
+    }
+
+    total = total * 1.06;
+
+    // Update main row with new info + total
+    await pool.query(
+      `UPDATE estimates
+       SET customer_id = $1, customer_info = $2, estimate_date = NOW(), total = $3
+       WHERE id = $4`,
+      [customer_id, customer_info, total, estimateId]
+    );
+
+    // Clear old items
+    await pool.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
+    await pool.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [estimateId]);
+
+    // Insert new variation items
+    for (const item of variationItems || []) {
+      await pool.query(
+        `INSERT INTO estimate_items (estimate_id, product_variation_id, quantity)
+         VALUES ($1, $2, $3)`,
+        [estimateId, item.variation_id, item.quantity]
+      );
+    }
+
+    // Insert new custom items
+    for (const item of customItems || []) {
+      await pool.query(
+        `INSERT INTO custom_estimate_items (estimate_id, product_name, size, price, quantity, accessory)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          estimateId,
+          item.product_name,
+          item.size,
+          item.price,
+          item.quantity,
+          item.accessory
+        ]
+      );
+    }
+
+    res.json({ message: 'Estimate updated', estimateId });
+
+  } catch (err) {
+    console.error('Error updating estimate:', err);
+    res.status(500).json({ error: 'Failed to update estimate', details: err.message });
   }
 });
 
-// Get line items for a specific estimate
+
+
+// Get BOTH variation + custom items for ONE estimate
 app.get('/api/estimates/:id/items', async (req, res) => {
   const estimateId = req.params.id;
 
   try {
-    const result = await pool.query(`
+    // ✅ Get variation items with product name
+    const { rows: variationItems } = await pool.query(`
       SELECT 
-        p.name AS product_name,
+        pv.id as variation_id,
         pv.size,
-        pv.accessory,
         pv.price,
+        pv.accessory,
+        pv.product_id,
+        p.name as product_name,
         ei.quantity
       FROM estimate_items ei
       JOIN product_variations pv ON ei.product_variation_id = pv.id
@@ -229,19 +331,61 @@ app.get('/api/estimates/:id/items', async (req, res) => {
       WHERE ei.estimate_id = $1
     `, [estimateId]);
 
-    res.json(result.rows);
+    // ✅ Get custom items
+    const { rows: customItems } = await pool.query(`
+      SELECT 
+        id as custom_id,
+        product_name,
+        size,
+        price,
+        quantity,
+        accessory
+      FROM custom_estimate_items
+      WHERE estimate_id = $1
+    `, [estimateId]);
+
+    // ✅ Combine both into ONE ARRAY
+    const combinedItems = [
+      ...variationItems.map(v => ({
+        type: 'variation',
+        product_name: v.product_name,
+        size: v.size,
+        price: v.price,
+        quantity: v.quantity,
+        accessory: v.accessory,
+        variation_id: v.variation_id
+      })),
+      ...customItems.map(c => ({
+        type: 'custom',
+        product_name: c.product_name,
+        size: c.size,
+        price: c.price,
+        quantity: c.quantity,
+        accessory: c.accessory,
+        variation_id: null // no variation for custom items
+      }))
+    ];
+
+    res.json(combinedItems);
+
   } catch (error) {
-    console.error('Error retrieving estimate items:', error);
+    console.error('Error fetching estimate items:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+
 
 // Delete an estimate
 app.delete('/api/estimates/:id', async (req, res) => {
   const estimateId = req.params.id;
 
   try {
+    // Delete BOTH item types first
     await pool.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
+    await pool.query(`DELETE FROM custom_items WHERE estimate_id = $1`, [estimateId]);
+
+    // Then delete the main estimate record
     await pool.query(`DELETE FROM estimates WHERE id = $1`, [estimateId]);
 
     res.json({ message: 'Estimate deleted' });
@@ -251,49 +395,57 @@ app.delete('/api/estimates/:id', async (req, res) => {
   }
 });
 
+
 // Save an invoice
 app.post('/api/invoices', async (req, res) => {
-  const { customerInfo, selectedItems } = req.body;
+  const { customer_id, customer_info, variationItems, customItems } = req.body;
 
   try {
+    // Create invoice
     const invoiceResult = await pool.query(
       `INSERT INTO invoices (customer_info, invoice_date, total)
        VALUES ($1, NOW(), $2)
        RETURNING id`,
-      [customerInfo, 0] // Initial total will be updated later
+      [customer_info, 0]
     );
-
     const invoiceId = invoiceResult.rows[0].id;
     let total = 0;
 
-    for (const item of selectedItems) {
-      if (!item.variationId) {
-        console.warn(`Skipping item without variationId:`, item);
-        continue;
-      }
-
+    // Insert variation items
+    for (const item of variationItems || []) {
       const variationResult = await pool.query(
         `SELECT price FROM product_variations WHERE id = $1`,
-        [item.variationId]
+        [item.variation_id]
       );
-
-      if (variationResult.rows.length === 0) {
-        console.error(`Variation ID ${item.variationId} not found`);
-        continue;
-      }
-
-      const price = variationResult.rows[0].price;
-      const quantity = item.quantity || 1;
-      total += price * quantity;
+      const price = variationResult.rows[0]?.price || 0;
+      total += price * item.quantity;
 
       await pool.query(
         `INSERT INTO invoice_items (invoice_id, product_variation_id, quantity)
          VALUES ($1, $2, $3)`,
-        [invoiceId, item.variationId, quantity]
+        [invoiceId, item.variation_id, item.quantity]
       );
     }
 
-    // Update the invoice with the calculated total (including 6% tax)
+    // Insert custom items
+    for (const item of customItems || []) {
+      total += parseFloat(item.price) * item.quantity;
+
+      await pool.query(
+        `INSERT INTO custom_invoice_items (invoice_id, product_name, size, price, quantity, accessory)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          invoiceId,
+          item.product_name,
+          item.size,
+          item.price,
+          item.quantity,
+          item.accessory,
+        ]
+      );
+    }
+
+    // Update total with tax
     const finalTotal = total * 1.06;
     await pool.query(
       `UPDATE invoices SET total = $1 WHERE id = $2`,
@@ -301,11 +453,13 @@ app.post('/api/invoices', async (req, res) => {
     );
 
     res.status(201).json({ message: 'Invoice saved', invoiceId });
+
   } catch (error) {
-    console.error('Error saving invoice:', error);
+    console.error('❌ Error saving invoice:', error);
     res.status(500).json({ error: 'Failed to save invoice' });
   }
 });
+
 
 // Save PDF for an invoice
 //app.post('/api/invoices/:id/pdf', async (req, res) => {
@@ -339,25 +493,40 @@ app.post('/api/invoices', async (req, res) => {
 //});
 
 // Get all invoices with total and PDF link
-app.get('/api/invoices', async (req, res) => {
+// Get ALL estimates with correct total (variations + custom)
+app.get('/api/estimates', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT 
-        i.id,
-        i.customer_info,
-        i.invoice_date,
-        i.total,
-        CONCAT('/invoices/', i.id, '.pdf') AS pdfLink
-      FROM invoices i
-      ORDER BY i.invoice_date DESC
+  e.id,
+  e.customer_info,
+  e.estimate_date,
+  ROUND((
+    COALESCE((
+      SELECT SUM(pv.price * ei.quantity)
+      FROM estimate_items ei
+      JOIN product_variations pv ON ei.product_variation_id = pv.id
+      WHERE ei.estimate_id = e.id
+    ), 0)
+    +
+    COALESCE((
+      SELECT SUM(cei.price * cei.quantity)
+      FROM custom_estimate_items cei
+      WHERE cei.estimate_id = e.id
+    ), 0)
+  ) * 1.06, 2) AS total
+FROM estimates e
+ORDER BY e.estimate_date DESC;
+
     `);
 
     res.json(result.rows);
   } catch (error) {
-    console.error('Error retrieving invoices:', error);
+    console.error('Error retrieving estimates:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 const PORT = process.env.PORT || 5000;
 
