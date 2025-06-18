@@ -461,6 +461,92 @@ app.post('/api/invoices', async (req, res) => {
 });
 
 
+// ✅ Get all invoices with total + customer info + optional PDF link
+app.get('/api/invoices', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        i.id,
+        i.customer_info,
+        i.invoice_date,
+        ROUND(i.total, 2) AS total
+      FROM invoices i
+      ORDER BY i.invoice_date DESC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error retrieving invoices:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// ✅ Add to backend index.js
+app.get('/api/invoices/:id/items', async (req, res) => {
+  const invoiceId = req.params.id;
+
+  try {
+    const { rows: variationItems } = await pool.query(
+      `SELECT pv.id as variation_id, pv.size, pv.price, pv.accessory, p.name as product_name, ii.quantity
+       FROM invoice_items ii
+       JOIN product_variations pv ON ii.product_variation_id = pv.id
+       JOIN products p ON pv.product_id = p.id
+       WHERE ii.invoice_id = $1`,
+      [invoiceId]
+    );
+
+    const { rows: customItems } = await pool.query(
+      `SELECT product_name, size, price, quantity, accessory
+       FROM custom_invoice_items
+       WHERE invoice_id = $1`,
+      [invoiceId]
+    );
+
+    const combinedItems = [
+      ...variationItems.map(v => ({
+        type: 'variation',
+        product_name: v.product_name,
+        size: v.size,
+        price: v.price,
+        quantity: v.quantity,
+        accessory: v.accessory,
+        variation_id: v.variation_id
+      })),
+      ...customItems.map(c => ({
+        type: 'custom',
+        product_name: c.product_name,
+        size: c.size,
+        price: c.price,
+        quantity: c.quantity,
+        accessory: c.accessory,
+        variation_id: null
+      }))
+    ];
+
+    res.json(combinedItems);
+  } catch (err) {
+    console.error('Error fetching invoice items:', err);
+    res.status(500).json({ error: 'Failed to load invoice items' });
+  }
+});
+
+
+app.delete('/api/invoices/:id', async (req, res) => {
+  const invoiceId = req.params.id;
+  try {
+    await pool.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [invoiceId]);
+    await pool.query(`DELETE FROM custom_invoice_items WHERE invoice_id = $1`, [invoiceId]);
+    await pool.query(`DELETE FROM invoices WHERE id = $1`, [invoiceId]);
+    res.json({ message: 'Invoice deleted' });
+  } catch (err) {
+    console.error('Error deleting invoice:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+
 // Save PDF for an invoice
 //app.post('/api/invoices/:id/pdf', async (req, res) => {
   //const { id } = req.params;
