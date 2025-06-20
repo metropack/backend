@@ -614,6 +614,23 @@ ORDER BY e.estimate_date DESC;
 });
 
 
+// Delete a variation by ID
+app.delete('/api/variations/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM product_variations WHERE id = $1', [id]);
+    res.json({ message: 'Variation deleted' });
+  } catch (error) {
+    console.error('Error deleting variation:', error);
+    res.status(500).json({ error: 'Failed to delete variation' });
+  }
+});
+
+
+
+
+
+
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, '0.0.0.0', () => {
